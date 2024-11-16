@@ -33,7 +33,6 @@ typedef struct {
 
 struct PwnDumpModel {
     MessageQueue* queue;
-
     Pwnagotchi* pwn;
 };
 
@@ -52,14 +51,19 @@ const NotificationSequence sequence_notification = {
     NULL,
 };
 
+static void message_queue_push_command(MessageQueue* queue, uint8_t parameterCode, uint8_t* arguments, size_t argument_len) {
+    PwnCommand cmd;
+    cmd.parameterCode = parameterCode;
+    memcpy(cmd.arguments, arguments, argument_len);
+    message_queue_push_message(queue, &cmd);
+}
+
 static void text_message_process(FuriString* receiver, uint8_t* arguments, const unsigned int max_text_len) {
     static char charStr[2] = "\0";
 
-    // Write over parameter with nothing
     furi_string_set_str(receiver, "");
 
     for(size_t i = 0; i < max_text_len; i++) {
-        // Break if we hit the end of the text
         if(arguments[i] == 0x00) {
             break;
         }
@@ -73,52 +77,10 @@ static bool flipagotchi_exec_cmd(PwnDumpModel* model) {
     if(message_queue_has_message(model->queue)) {
         PwnCommand cmd;
         message_queue_pop_message(model->queue, &cmd);
-        FURI_LOG_D("PWN", "Has message (code: %d), processing...", cmd.parameterCode);
 
-        // See what the cmd wants
         switch(cmd.parameterCode) {
-        // Process Face
-        case 0x04: {
-            // Adding 4 to account for the offset that is required above 0x03
-            int face = cmd.arguments[0] - 4;
-
-            if(face < 0) {
-                face = 0;
-            }
-
-            model->pwn->face = cmd.arguments[0] - 4;
-
-            break;
-        }
-        // Process Name
-        case 0x05: {
-            text_message_process(model->pwn->hostname, cmd.arguments, PWNAGOTCHI_MAX_HOSTNAME_LEN);
-            break;
-        }
-        // Process channel
-        case 0x06: {
-            text_message_process(model->pwn->channel, cmd.arguments, PWNAGOTCHI_MAX_CHANNEL_LEN);
-            break;
-        }
-        // Process APS (Access Points)
-        case 0x07: {
-            text_message_process(model->pwn->apStat, cmd.arguments, PWNAGOTCHI_MAX_APS_LEN);
-            break;
-        }
-        // Process uptime
-        case 0x08: {
-            text_message_process(model->pwn->uptime, cmd.arguments, PWNAGOTCHI_MAX_UPTIME_LEN);
-            break;
-        }
-        // Process friend
-        case 0x09: {
-            // Friend not implemented yet
-            break;
-        }
-        // Process mode
-        case 0x0a: {
+        case 0x0a: { // Process mode change
             enum PwnagotchiMode mode;
-
             switch(cmd.arguments[0]) {
             case 0x04:
                 mode = PwnMode_Manual;
@@ -126,28 +88,15 @@ static bool flipagotchi_exec_cmd(PwnDumpModel* model) {
             case 0x05:
                 mode = PwnMode_Auto;
                 break;
-            case 0x06:
-                mode = PwnMode_Ai;
-                break;
             default:
                 mode = PwnMode_Manual;
                 break;
             }
             model->pwn->mode = mode;
-
             break;
         }
-        // Process Handshakes
-        case 0x0b: {
-            text_message_process(
-                model->pwn->handshakes, cmd.arguments, PWNAGOTCHI_MAX_HANDSHAKES_LEN);
+        default:
             break;
-        }
-        // Process message
-        case 0x0c: {
-            text_message_process(model->pwn->message, cmd.arguments, PWNAGOTCHI_MAX_MESSAGE_LEN);
-            break;
-        }
         }
     }
 
@@ -156,13 +105,31 @@ static bool flipagotchi_exec_cmd(PwnDumpModel* model) {
 
 static void flipagotchi_view_draw_callback(Canvas* canvas, void* _model) {
     PwnDumpModel* model = _model;
-
     pwnagotchi_draw_all(model->pwn, canvas);
 }
 
 static bool flipagotchi_view_input_callback(InputEvent* event, void* context) {
-    UNUSED(event);
-    UNUSED(context);
+    PwnDumpModel* model = context;
+
+    if(event->type == InputTypePress) {
+        switch(event->key) {
+            case InputKeyUp:
+                message_queue_push_command(model->queue, 0x0a, (uint8_t[]){0x05}, 1);
+                model->pwn->mode = PwnMode_Auto;
+                notification_message(model->app->notification, &sequence_notification);
+                break;
+
+            case InputKeyDown:
+                message_queue_push_command(model->queue, 0x0a, (uint8_t[]){0x04}, 1);
+                model->pwn->mode = PwnMode_Manual;
+                notification_message(model->app->notification, &sequence_notification);
+                break;
+
+            default:
+                break;
+        }
+        return true;
+    }
     return false;
 }
 
@@ -191,12 +158,9 @@ static int32_t flipagotchi_worker(void* context) {
     FlipagotchiApp* app = context;
 
     while(true) {
-        bool update = false;
-        uint32_t events =
-            furi_thread_flags_wait(WORKER_EVENTS_MASK, FuriFlagWaitAny, FuriWaitForever);
-        furi_check((events & FuriFlagError) == 0);
-
+        uint32_t events = furi_thread_flags_wait(WORKER_EVENTS_MASK, FuriFlagWaitAny, FuriWaitForever);
         if(events & WorkerEventStop) break;
+
         if(events & WorkerEventRx) {
             size_t length = 0;
             do {
@@ -210,15 +174,11 @@ static int32_t flipagotchi_worker(void* context) {
                             for(size_t i = 0; i < length; i++) {
                                 flipagotchi_push_to_list(model, data[i]);
                             }
-                            update = flipagotchi_exec_cmd(model);
+                            flipagotchi_exec_cmd(model);
                         },
-                        update);
+                        true);
                 }
             } while(length > 0);
-
-            notification_message(app->notification, &sequence_notification);
-            // with_view_model(
-            // app->view, PwnDumpModel * model, { UNUSED(model); }, true);
         }
     }
     return 0;
@@ -228,17 +188,13 @@ static FlipagotchiApp* flipagotchi_app_alloc() {
     FlipagotchiApp* app = malloc(sizeof(FlipagotchiApp));
 
     app->rx_stream = furi_stream_buffer_alloc(2048, 1);
-
-    // Gui
     app->gui = furi_record_open(RECORD_GUI);
     app->notification = furi_record_open(RECORD_NOTIFICATION);
 
-    // View dispatcher
     app->view_dispatcher = view_dispatcher_alloc();
     view_dispatcher_enable_queue(app->view_dispatcher);
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
 
-    // Views
     app->view = view_alloc();
     view_set_draw_callback(app->view, flipagotchi_view_draw_callback);
     view_set_input_callback(app->view, flipagotchi_view_input_callback);
@@ -256,16 +212,11 @@ static FlipagotchiApp* flipagotchi_app_alloc() {
     view_dispatcher_add_view(app->view_dispatcher, 0, app->view);
     view_dispatcher_switch_to_view(app->view_dispatcher, 0);
 
-    // Enable uart listener
     app->serial_handle = furi_hal_serial_control_acquire(PWNAGOTCHI_UART_CHANNEL);
-
-    furi_check(app->serial_handle);
     furi_hal_serial_init(app->serial_handle, PWNAGOTCHI_UART_BAUD);
     furi_hal_serial_async_rx_start(app->serial_handle, flipagotchi_on_irq_cb, app, true);
 
     app->worker_thread = furi_thread_alloc();
-    furi_thread_set_name(app->worker_thread, "UsbUartWorker");
-    furi_thread_set_stack_size(app->worker_thread, 1024);
     furi_thread_set_context(app->worker_thread, app);
     furi_thread_set_callback(app->worker_thread, flipagotchi_worker);
     furi_thread_start(app->worker_thread);
@@ -274,23 +225,17 @@ static FlipagotchiApp* flipagotchi_app_alloc() {
 }
 
 static void flipagotchi_app_free(FlipagotchiApp* app) {
-    furi_assert(app);
-
-    // Kill and free thread
     furi_thread_flags_set(furi_thread_get_id(app->worker_thread), WorkerEventStop);
     furi_thread_join(app->worker_thread);
     furi_thread_free(app->worker_thread);
 
-    // Release control of serial
     furi_hal_serial_deinit(app->serial_handle);
     furi_hal_serial_control_release(app->serial_handle);
 
-    // Free views
     view_dispatcher_remove_view(app->view_dispatcher, 0);
-
     with_view_model(
         app->view,
-        PwnDumpModel * model,
+        PwnDumpModel* model,
         {
             message_queue_free(model->queue);
             pwnagotchi_free(model->pwn);
@@ -299,14 +244,10 @@ static void flipagotchi_app_free(FlipagotchiApp* app) {
     view_free(app->view);
     view_dispatcher_free(app->view_dispatcher);
 
-    // Close gui record
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_NOTIFICATION);
-    app->gui = NULL;
-
     furi_stream_buffer_free(app->rx_stream);
 
-    // Free rest
     free(app);
 }
 
